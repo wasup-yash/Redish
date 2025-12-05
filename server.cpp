@@ -1,19 +1,15 @@
-// stdlib
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-
- //system
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
-// C++
 #include <vector>
 
 
@@ -75,8 +71,8 @@ static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
 static Conn *handle_accept(int fd) {
     // accept
     struct sockaddr_in client_addr = {};
-    socklen_t socklen = sizeof(client_addr);
-    int connfd = accept(fd, (struct sockaddr *)&client_addr, &socklen);
+    socklen_t addrlen = sizeof(client_addr);
+    int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
     if (connfd < 0) {
         msg_errno("accept() error");
         return NULL;
