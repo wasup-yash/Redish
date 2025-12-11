@@ -1,18 +1,15 @@
-// stdlib
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-// system
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
-// C++
 #include <string>
 #include <vector>
 #include <map>
@@ -162,13 +159,13 @@ enum {
 // +--------+---------+
 struct Response {
     uint32_t status = 0;
-    std::vector<uint8_t> data;
+   //std::vector<uint8_t> data;
 };
 
-// placeholder; implemented later
 static std::map<std::string, std::string> g_data;
 
-static void do_request(std::vector<std::string> &cmd, Response &out) {
+// The function signature is updated to include `outgoing`
+static void do_request(std::vector<std::string> &cmd, Response &out, std::vector<uint8_t> &outgoing) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         auto it = g_data.find(cmd[1]);
         if (it == g_data.end()) {
@@ -176,21 +173,54 @@ static void do_request(std::vector<std::string> &cmd, Response &out) {
             return;
         }
         const std::string &val = it->second;
-        out.data.assign(val.begin(), val.end());
+        out.status = RES_OK;
+
+        // **MODIFICATION:** Instead of copying to `resp.data`, we prepare to write directly.
+        // The actual data copy will happen in `make_response` (or should be here).
+        // To be zero-copy, we must append the data here *before* calling make_response,
+        // which will then calculate the total length and prepend it.
+
+        // We can't fully zero-copy for 'get' in this structure because the total
+        // response length (header + data) must be prepended.
+        // A temporary solution is to have `do_request` only set status for 'get'
+        // and let `make_response` handle the entire response structure, including data.
+
+        // `do_request` will write the *payload* to `outgoing`
+        // only for 'get', and `make_response` will calculate/prepend the header.
+
+        // Zero-copy attempt for GET: Write the key's value directly to `outgoing`.
+        // The rest of the `make_response` function will be modified to handle the prepending
+        // of length and status correctly.
+        outgoing.insert(outgoing.end(), val.begin(), val.end());
     } else if (cmd.size() == 3 && cmd[0] == "set") {
         g_data[cmd[1]].swap(cmd[2]);
+        out.status = RES_OK; // Explicitly set OK status
     } else if (cmd.size() == 2 && cmd[0] == "del") {
         g_data.erase(cmd[1]);
+        out.status = RES_OK; // Explicitly set OK status
     } else {
         out.status = RES_ERR;       // unrecognized command
     }
 }
 
-static void make_response(const Response &resp, std::vector<uint8_t> &out) {
-    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
-    buf_append(out, (const uint8_t *)&resp_len, 4);
-    buf_append(out, (const uint8_t *)&resp.status, 4);
-    buf_append(out, resp.data.data(), resp.data.size());
+// The function is updated to take `data_len`
+static void make_response(const Response &resp, std::vector<uint8_t> &out, size_t data_len) {
+    uint32_t status_and_data_len = 4 + (uint32_t)data_len;
+    uint32_t total_resp_len = 4 + status_and_data_len;
+
+    // 1. Make space for the 4-byte total length and 4-byte status at the beginning of the data
+    out.insert(out.end() - data_len, 8, 0); // Insert 8 empty bytes before the data payload
+
+    // 2. The newly inserted 8 bytes start at `out.end() - data_len - 8`
+    size_t header_pos = out.size() - data_len - 8;
+
+    // 3. Write the response length (4 bytes)
+    memcpy(&out[header_pos], &status_and_data_len, 4);
+
+    // 4. Write the status (4 bytes)
+    memcpy(&out[header_pos + 4], &resp.status, 4);
+
+    // If status is not OK/NX, the data_len will be 0, and this logic still works.
 }
 
 // process 1 request if there is enough data
@@ -219,14 +249,20 @@ static bool try_one_request(Conn *conn) {
         conn->want_close = true;
         return false;   // want close
     }
+    // --- MODIFICATION HERE ---
     Response resp;
-    do_request(cmd, resp);
-    make_response(resp, conn->outgoing);
+    size_t pre_write_size = conn->outgoing.size(); // 1. Save buffer size before writing
+    do_request(cmd, resp, conn->outgoing);         // 2. Run request, which may append data
+    size_t data_len = conn->outgoing.size() - pre_write_size;
+
+    // 3. Construct the response header/wrapper around the newly appended data
+    make_response(resp, conn->outgoing, data_len);
+    // -------------------------
 
     // application logic done! remove the request message.
     buf_consume(conn->incoming, 4 + len);
     // Q: Why not just empty the buffer? See the explanation of "pipelining".
-    return true;        // success
+    return true;
 }
 
 // application callback when the socket is writable
