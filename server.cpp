@@ -12,7 +12,11 @@
 #include <netinet/ip.h>
 #include <string>
 #include <vector>
-#include <map>
+#include "hashtable.h"
+
+
+#define container_of(ptr, T, member) \
+    ((T *)( (char *)ptr - offsetof(T, member) ))
 
 
 static void msg(const char *msg) {
@@ -159,68 +163,103 @@ enum {
 // +--------+---------+
 struct Response {
     uint32_t status = 0;
-   //std::vector<uint8_t> data;
+    std::vector<uint8_t> data;
 };
 
-static std::map<std::string, std::string> g_data;
+// global states
+static struct {
+    HMap db;    // top-level hashtable
+} g_data;
 
-// The function signature is updated to include `outgoing`
-static void do_request(std::vector<std::string> &cmd, Response &out, std::vector<uint8_t> &outgoing) {
+// KV pair for the top-level hashtable
+struct Entry {
+    struct HNode node;  // hashtable node
+    std::string key;
+    std::string val;
+};
+
+// equality comparison for `struct Entry`
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return le->key == re->key;
+}
+
+// FNV hash
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static void do_get(std::vector<std::string> &cmd, Response &out) {
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable lookup
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        out.status = RES_NX;
+        return;
+    }
+    // copy the value
+    const std::string &val = container_of(node, Entry, node)->val;
+    assert(val.size() <= k_max_msg);
+    out.data.assign(val.begin(), val.end());
+}
+
+static void do_set(std::vector<std::string> &cmd, Response &) {
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable lookup
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        // found, update the value
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    } else {
+        // not found, allocate & insert a new pair
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+}
+
+static void do_del(std::vector<std::string> &cmd, Response &) {
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable delete
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+    if (node) { // deallocate the pair
+        delete container_of(node, Entry, node);
+    }
+}
+
+static void do_request(std::vector<std::string> &cmd, Response &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        auto it = g_data.find(cmd[1]);
-        if (it == g_data.end()) {
-            out.status = RES_NX;    // not found
-            return;
-        }
-        const std::string &val = it->second;
-        out.status = RES_OK;
-
-        // **MODIFICATION:** Instead of copying to `resp.data`, we prepare to write directly.
-        // The actual data copy will happen in `make_response` (or should be here).
-        // To be zero-copy, we must append the data here *before* calling make_response,
-        // which will then calculate the total length and prepend it.
-
-        // We can't fully zero-copy for 'get' in this structure because the total
-        // response length (header + data) must be prepended.
-        // A temporary solution is to have `do_request` only set status for 'get'
-        // and let `make_response` handle the entire response structure, including data.
-
-        // `do_request` will write the *payload* to `outgoing`
-        // only for 'get', and `make_response` will calculate/prepend the header.
-
-        // Zero-copy attempt for GET: Write the key's value directly to `outgoing`.
-        // The rest of the `make_response` function will be modified to handle the prepending
-        // of length and status correctly.
-        outgoing.insert(outgoing.end(), val.begin(), val.end());
+        return do_get(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
-        g_data[cmd[1]].swap(cmd[2]);
-        out.status = RES_OK; // Explicitly set OK status
+        return do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
-        g_data.erase(cmd[1]);
-        out.status = RES_OK; // Explicitly set OK status
+        return do_del(cmd, out);
     } else {
         out.status = RES_ERR;       // unrecognized command
     }
 }
 
-// The function is updated to take `data_len`
-static void make_response(const Response &resp, std::vector<uint8_t> &out, size_t data_len) {
-    uint32_t status_and_data_len = 4 + (uint32_t)data_len;
-    uint32_t total_resp_len = 4 + status_and_data_len;
-
-    // 1. Make space for the 4-byte total length and 4-byte status at the beginning of the data
-    out.insert(out.end() - data_len, 8, 0); // Insert 8 empty bytes before the data payload
-
-    // 2. The newly inserted 8 bytes start at `out.end() - data_len - 8`
-    size_t header_pos = out.size() - data_len - 8;
-
-    // 3. Write the response length (4 bytes)
-    memcpy(&out[header_pos], &status_and_data_len, 4);
-
-    // 4. Write the status (4 bytes)
-    memcpy(&out[header_pos + 4], &resp.status, 4);
-
-    // If status is not OK/NX, the data_len will be 0, and this logic still works.
+static void make_response(const Response &resp, std::vector<uint8_t> &out) {
+    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
+    buf_append(out, (const uint8_t *)&resp_len, 4);
+    buf_append(out, (const uint8_t *)&resp.status, 4);
+    buf_append(out, resp.data.data(), resp.data.size());
 }
 
 // process 1 request if there is enough data
@@ -249,20 +288,14 @@ static bool try_one_request(Conn *conn) {
         conn->want_close = true;
         return false;   // want close
     }
-    // --- MODIFICATION HERE ---
     Response resp;
-    size_t pre_write_size = conn->outgoing.size(); // 1. Save buffer size before writing
-    do_request(cmd, resp, conn->outgoing);         // 2. Run request, which may append data
-    size_t data_len = conn->outgoing.size() - pre_write_size;
-
-    // 3. Construct the response header/wrapper around the newly appended data
-    make_response(resp, conn->outgoing, data_len);
-    // -------------------------
+    do_request(cmd, resp);
+    make_response(resp, conn->outgoing);
 
     // application logic done! remove the request message.
     buf_consume(conn->incoming, 4 + len);
     // Q: Why not just empty the buffer? See the explanation of "pipelining".
-    return true;
+    return true;        // success
 }
 
 // application callback when the socket is writable
