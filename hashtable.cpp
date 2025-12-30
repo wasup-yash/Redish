@@ -2,6 +2,7 @@
 #include <stdlib.h>     // calloc(), free()
 #include "hashtable.h"
 
+
 // n must be a power of 2
 static void h_init(HTab *htab, size_t n) {
     assert(n > 0 && ((n - 1) & n) == 0);
@@ -10,6 +11,7 @@ static void h_init(HTab *htab, size_t n) {
     htab->size = 0;
 }
 
+// hashtable insertion
 static void h_insert(HTab *htab, HNode *node) {
     size_t pos = node->hcode & htab->mask;
     HNode *next = htab->tab[pos];
